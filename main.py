@@ -38,16 +38,16 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 # BUG FIX: gemini-2.0-flash-lite đã bị remove → 404
 # Dùng các model ổn định hơn
 GEMINI_MODELS: List[str] = [
-    "gemini-2.0-flash",        # moi nhat, on dinh (KHONG phai flash-lite)
-    "gemini-1.5-flash",        # fallback on dinh
-    "gemini-1.5-flash-8b",     # nhe hon
-    "gemini-1.5-pro",          # manh hon, dung cuoi
+    "gemini-1.5-flash-8b",     # free tier: 1500 req/day, ít 429 nhất
+    "gemini-1.5-flash",        # 1500 req/day fallback
+    "gemini-2.0-flash",        # 1500 req/day, thử sau
+    "gemini-1.5-pro",          # 50 req/day, chỉ dùng cuối cùng
 ]
 
 # Model ho tro vision (image input)
 GEMINI_VISION_MODELS: List[str] = [
-    "gemini-2.0-flash",
     "gemini-1.5-flash",
+    "gemini-2.0-flash",
     "gemini-1.5-pro",
 ]
 
@@ -109,6 +109,41 @@ class KeyPool:
 key_pool = KeyPool(GEMINI_KEYS)
 
 # ══════════════════════════════════════════════════════════
+#  RATE LIMITER  (free tier: 15 RPM per model)
+# ══════════════════════════════════════════════════════════
+class RateLimiter:
+    """Token bucket — max 12 req/min per model (safe margin dưới 15 RPM)."""
+    def __init__(self, rpm: int = 12) -> None:
+        self._rpm      = rpm
+        self._calls: Dict[str, List[float]] = {}
+
+    def _clean(self, model: str, now: float) -> None:
+        cutoff = now - 60.0
+        self._calls[model] = [t for t in self._calls.get(model, []) if t > cutoff]
+
+    def available(self, model: str) -> bool:
+        now = time.time()
+        self._clean(model, now)
+        return len(self._calls.get(model, [])) < self._rpm
+
+    def record(self, model: str) -> None:
+        now = time.time()
+        self._clean(model, now)
+        self._calls.setdefault(model, []).append(now)
+
+    def wait_seconds(self, model: str) -> float:
+        """Số giây cần chờ để có slot tiếp theo."""
+        now = time.time()
+        self._clean(model, now)
+        calls = self._calls.get(model, [])
+        if len(calls) < self._rpm:
+            return 0.0
+        oldest = min(calls)
+        return max(0.0, oldest + 60.0 - now)
+
+rate_limiter = RateLimiter(rpm=5)
+
+# ══════════════════════════════════════════════════════════
 #  MODEL HEALTH
 # ══════════════════════════════════════════════════════════
 _model_dead_until: Dict[str, float] = {}
@@ -125,7 +160,7 @@ def _kill_model(model: str, seconds: int = 60) -> None:
 # ══════════════════════════════════════════════════════════
 #  GEMINI CALL  (text-only)
 # ══════════════════════════════════════════════════════════
-_gemini_sem = asyncio.Semaphore(3)
+_gemini_sem = asyncio.Semaphore(1)  # queue: chỉ 1 call Gemini tại 1 thời điểm → không bao giờ burst 429
 
 async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
     if not GEMINI_KEYS:
@@ -138,67 +173,75 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
     async with _gemini_sem:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             for model in models:
-                for attempt in range(2):
+                # Rate limit: đảm bảo khoảng cách tối thiểu giữa các call
+                wait_s = rate_limiter.wait_seconds(model)
+                if wait_s > 0:
+                    if wait_s > 30:
+                        log.warning("Rate limit: %s chờ %.1fs > 30s, thử model tiếp", model, wait_s)
+                        continue  # skip sang model khác
+                    log.info("Rate limit: chờ %.1fs cho %s", wait_s, model)
+                    await asyncio.sleep(wait_s)
+
+                key = key_pool.get()
+                if not key:
+                    await asyncio.sleep(5)
                     key = key_pool.get()
                     if not key:
-                        await asyncio.sleep(10)
-                        key = key_pool.get()
-                        if not key:
-                            raise HTTPException(429, detail="Quota Gemini tạm thời hết")
+                        raise HTTPException(429, detail="Quota Gemini tạm thời hết")
 
-                    url = (
-                        "https://generativelanguage.googleapis.com/v1beta/models/"
-                        f"{model}:generateContent?key={key}"
-                    )
-                    body = {
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "maxOutputTokens": max_tokens,
-                            "temperature": 0.2,
-                        },
-                    }
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={key}"
+                )
+                body = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens,
+                        "temperature": 0.2,
+                    },
+                }
 
+                try:
+                    res = await client.post(url, json=body)
+                except httpx.TimeoutException:
+                    log.warning("Timeout %s", model)
+                    continue
+                except httpx.RequestError as e:
+                    log.warning("Network error %s: %s", model, e)
+                    continue
+
+                if res.status_code == 200:
                     try:
-                        res = await client.post(url, json=body)
-                    except httpx.TimeoutException:
-                        log.warning("Timeout %s attempt %d", model, attempt + 1)
-                        break
-                    except httpx.RequestError as e:
-                        log.warning("Network error %s: %s", model, e)
-                        break
+                        data = res.json()
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        rate_limiter.record(model)
+                        return text
+                    except (KeyError, IndexError, json.JSONDecodeError) as e:
+                        log.error("Parse error %s: %s", model, e)
+                        continue
 
-                    if res.status_code == 200:
-                        try:
-                            data = res.json()
-                            text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            return text
-                        except (KeyError, IndexError, json.JSONDecodeError) as e:
-                            log.error("Parse error %s: %s", model, e)
-                            break
+                if res.status_code == 429:
+                    retry_after = int(res.headers.get("Retry-After", "0"))
+                    wait = max(retry_after, 20) + random.uniform(0, 5)
+                    wait = min(wait, 65)
+                    log.warning("429 %s backoff %.1fs", model, wait)
+                    key_pool.penalize(key, int(wait))
+                    # Ghi nhận rate limit hit để skip model này
+                    for _ in range(12):  # fill bucket → model bị skip tạm
+                        rate_limiter.record(model)
+                    continue
 
-                    if res.status_code == 429:
-                        retry_after = int(res.headers.get("Retry-After", "0"))
-                        base = 15 * (2 ** attempt)
-                        wait = min(max(retry_after, base) + random.uniform(0, 5), 60)
-                        log.warning("429 %s, backoff %.1fs", model, wait)
-                        key_pool.penalize(key, int(wait))
-                        if attempt == 0:
-                            await asyncio.sleep(wait)
-                            continue
-                        break
+                if res.status_code == 404:
+                    _kill_model(model, 60)
+                    log.error("404 model not found: %s", model)
+                    continue
 
-                    if res.status_code == 404:
-                        _kill_model(model, 60)
-                        log.error("404 model not found: %s — killed 600s", model)
-                        break
+                if res.status_code in (400, 403):
+                    detail = res.text[:300]
+                    log.error("Hard error %d %s: %s", res.status_code, model, detail)
+                    raise HTTPException(res.status_code, detail=f"Gemini: {detail}")
 
-                    if res.status_code in (400, 403):
-                        detail = res.text[:300]
-                        log.error("Hard error %d %s: %s", res.status_code, model, detail)
-                        raise HTTPException(res.status_code, detail=f"Gemini: {detail}")
-
-                    log.warning("Unexpected %d %s", res.status_code, model)
-                    break
+                log.warning("Unexpected %d %s", res.status_code, model)
 
     raise HTTPException(503, detail="Gemini không phản hồi được. Thử lại sau.")
 
@@ -319,12 +362,16 @@ class ProxyAIRequest(BaseModel):
 @app.get("/health")
 async def health() -> Dict:
     live = _live_models(GEMINI_MODELS)
+    rate_info = {m: rate_limiter.wait_seconds(m) for m in GEMINI_MODELS}
+    available_models = [m for m in live if rate_limiter.available(m)]
     return {
-        "status":      "ok",
-        "gemini_keys": len(GEMINI_KEYS),
-        "virustotal":  bool(VT_KEY),
-        "live_models": live,          # FIX: trả về đúng live models
-        "cache_size":  len(_cache),
+        "status":            "ok" if available_models else "degraded",
+        "gemini_keys":       len(GEMINI_KEYS),
+        "virustotal":        bool(VT_KEY),
+        "live_models":       live,
+        "available_models":  available_models,
+        "rate_wait_seconds": rate_info,
+        "cache_size":        len(_cache),
     }
 
 
