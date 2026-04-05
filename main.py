@@ -22,7 +22,7 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════
-GEMINI_KEY   = os.getenv("AIzaSyB4QDHHMr4NO-TRehkHRC27LLQc3Cr0l1c", "")
+GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
 VT_KEY       = os.getenv("VIRUSTOTAL_API_KEY", "")
 ORIGINS      = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
