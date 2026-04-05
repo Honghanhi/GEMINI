@@ -33,22 +33,20 @@ _raw_keys = os.getenv("GEMINI_API_KEYS", "") or os.getenv("GEMINI_API_KEY", "")
 GEMINI_KEYS: List[str] = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
 VT_KEY    = os.getenv("VIRUSTOTAL_API_KEY", "")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 tiếng — tránh gọi lại Gemini cho cùng nội dung
 
 # BUG FIX: gemini-2.0-flash-lite đã bị remove → 404
 # Dùng các model ổn định hơn
 GEMINI_MODELS: List[str] = [
-    "gemini-1.5-flash-8b",     # free tier: 1500 req/day, ít 429 nhất
-    "gemini-1.5-flash",        # 1500 req/day fallback
-    "gemini-2.0-flash",        # 1500 req/day, thử sau
-    "gemini-1.5-pro",          # 50 req/day, chỉ dùng cuối cùng
+    "gemini-2.0-flash",           # model duy nhất hoạt động với key này
+    "gemini-2.0-flash-lite",      # fallback thử lại
+    "gemini-2.0-flash-exp",       # experimental fallback
 ]
 
 # Model ho tro vision (image input)
 GEMINI_VISION_MODELS: List[str] = [
-    "gemini-1.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp",
 ]
 
 TIMEOUT = httpx.Timeout(25.0, connect=8.0)
@@ -141,7 +139,7 @@ class RateLimiter:
         oldest = min(calls)
         return max(0.0, oldest + 60.0 - now)
 
-rate_limiter = RateLimiter(rpm=5)
+rate_limiter = RateLimiter(rpm=3)
 
 # ══════════════════════════════════════════════════════════
 #  MODEL HEALTH
@@ -222,13 +220,23 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
 
                 if res.status_code == 429:
                     retry_after = int(res.headers.get("Retry-After", "0"))
-                    wait = max(retry_after, 20) + random.uniform(0, 5)
-                    wait = min(wait, 65)
-                    log.warning("429 %s backoff %.1fs", model, wait)
+                    wait = max(retry_after, 60) + random.uniform(0, 10)
+                    log.warning("429 %s — chờ %.1fs rồi thử lại", model, wait)
                     key_pool.penalize(key, int(wait))
-                    # Ghi nhận rate limit hit để skip model này
-                    for _ in range(12):  # fill bucket → model bị skip tạm
+                    # Fill bucket để rate_limiter tự skip model này ~60s
+                    for _ in range(3):
                         rate_limiter.record(model)
+                    await asyncio.sleep(wait)
+                    # Thử lại 1 lần sau khi chờ
+                    try:
+                        res2 = await client.post(url, json=body)
+                        if res2.status_code == 200:
+                            data2 = res2.json()
+                            text2 = data2["candidates"][0]["content"]["parts"][0]["text"]
+                            rate_limiter.record(model)
+                            return text2
+                    except Exception:
+                        pass
                     continue
 
                 if res.status_code == 404:
