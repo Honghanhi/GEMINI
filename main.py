@@ -1,13 +1,6 @@
 """
-AI-PROOF Backend  —  FastAPI + Gemini API
-Python 3.9.18 compatible
-
-ENV VARS:
-  GEMINI_API_KEY=your_key_here           ← bắt buộc
-  GEMINI_API_KEYS=key1,key2,key3         ← tuỳ chọn, multi-key load balancing
-  VIRUSTOTAL_API_KEY=your_key_here       ← tuỳ chọn
-  ALLOWED_ORIGINS=https://your-site.com  ← tuỳ chọn, mặc định *
-  CACHE_TTL=300                          ← giây, mặc định 300
+AI-PROOF Backend  —  FastAPI + Gemini API  v2.2
+Fixed: model list (gemini-2.0-flash-lite removed → 404), added /analyze/image
 """
 
 import os, json, asyncio, time, random, hashlib, logging, base64, datetime
@@ -32,15 +25,23 @@ GEMINI_KEYS: List[str] = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 VT_KEY    = os.getenv("VIRUSTOTAL_API_KEY", "")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 
+# BUG FIX: gemini-2.0-flash-lite đã bị remove → 404
+# Dùng các model ổn định hơn
 GEMINI_MODELS: List[str] = [
-    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",        # nhanh, ổn định
+    "gemini-1.5-flash-8b",     # nhẹ hơn, fallback
+    "gemini-1.5-pro",          # mạnh hơn, dùng khi flash fail
+]
+
+# Model hỗ trợ vision (image input)
+GEMINI_VISION_MODELS: List[str] = [
     "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
 ]
 
 TIMEOUT = httpx.Timeout(25.0, connect=8.0)
 
-app = FastAPI(title="AI-PROOF Backend", version="2.1.0")
+app = FastAPI(title="AI-PROOF Backend", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,10 +50,9 @@ app.add_middleware(
 )
 
 # ══════════════════════════════════════════════════════════
-#  CACHE  (in-memory)
+#  CACHE
 # ══════════════════════════════════════════════════════════
 _cache: Dict[str, Tuple[float, Dict]] = {}
-
 
 def _cache_get(key: str) -> Optional[Dict]:
     entry = _cache.get(key)
@@ -61,25 +61,20 @@ def _cache_get(key: str) -> Optional[Dict]:
     _cache.pop(key, None)
     return None
 
-
 def _cache_set(key: str, value: Dict, ttl: int = CACHE_TTL) -> None:
     if len(_cache) >= 500:
         oldest = min(_cache, key=lambda k: _cache[k][0])
         _cache.pop(oldest, None)
     _cache[key] = (time.time() + ttl, value)
 
-
 def _cache_key(*parts: Any) -> str:
     raw = "|".join(str(p) for p in parts)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
 
 # ══════════════════════════════════════════════════════════
 #  KEY POOL
 # ══════════════════════════════════════════════════════════
 class KeyPool:
-    """Round-robin key pool với per-key cooldown."""
-
     def __init__(self, keys: List[str]) -> None:
         self._keys = keys
         self._cooldown: Dict[str, float] = {}
@@ -99,7 +94,6 @@ class KeyPool:
         self._cooldown[key] = time.time() + seconds
         log.warning("Key ...%s penalized %ds", key[-6:], seconds)
 
-
 key_pool = KeyPool(GEMINI_KEYS)
 
 # ══════════════════════════════════════════════════════════
@@ -107,28 +101,25 @@ key_pool = KeyPool(GEMINI_KEYS)
 # ══════════════════════════════════════════════════════════
 _model_dead_until: Dict[str, float] = {}
 
-
-def _live_models() -> List[str]:
+def _live_models(model_list: List[str] = None) -> List[str]:
     now = time.time()
-    return [m for m in GEMINI_MODELS if _model_dead_until.get(m, 0) <= now]
-
+    src = model_list or GEMINI_MODELS
+    return [m for m in src if _model_dead_until.get(m, 0) <= now]
 
 def _kill_model(model: str, seconds: int = 300) -> None:
     _model_dead_until[model] = time.time() + seconds
     log.warning("Model %s disabled %ds", model, seconds)
 
-
 # ══════════════════════════════════════════════════════════
-#  GEMINI CALL
+#  GEMINI CALL  (text-only)
 # ══════════════════════════════════════════════════════════
 _gemini_sem = asyncio.Semaphore(3)
-
 
 async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
     if not GEMINI_KEYS:
         raise HTTPException(503, detail="Chưa cấu hình GEMINI_API_KEY")
 
-    models = _live_models()
+    models = _live_models(GEMINI_MODELS)
     if not models:
         raise HTTPException(503, detail="Tất cả Gemini models tạm thời không khả dụng")
 
@@ -141,7 +132,7 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
                         await asyncio.sleep(10)
                         key = key_pool.get()
                         if not key:
-                            raise HTTPException(429, detail="Quota Gemini tạm thời hết, thử lại sau ít phút")
+                            raise HTTPException(429, detail="Quota Gemini tạm thời hết")
 
                     url = (
                         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -167,20 +158,17 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
                     if res.status_code == 200:
                         try:
                             data = res.json()
-                            text = (
-                                data["candidates"][0]["content"]["parts"][0]["text"]
-                            )
+                            text = data["candidates"][0]["content"]["parts"][0]["text"]
                             return text
                         except (KeyError, IndexError, json.JSONDecodeError) as e:
-                            log.error("Parse error %s: %s | raw: %s", model, e, res.text[:200])
+                            log.error("Parse error %s: %s", model, e)
                             break
 
                     if res.status_code == 429:
                         retry_after = int(res.headers.get("Retry-After", "0"))
                         base = 15 * (2 ** attempt)
-                        wait = max(retry_after, base) + random.uniform(0, 5)
-                        wait = min(wait, 60)
-                        log.warning("429 %s key ...%s, backoff %.1fs", model, key[-6:], wait)
+                        wait = min(max(retry_after, base) + random.uniform(0, 5), 60)
+                        log.warning("429 %s, backoff %.1fs", model, wait)
                         key_pool.penalize(key, int(wait))
                         if attempt == 0:
                             await asyncio.sleep(wait)
@@ -189,6 +177,7 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
 
                     if res.status_code == 404:
                         _kill_model(model, 600)
+                        log.error("404 model not found: %s — killed 600s", model)
                         break
 
                     if res.status_code in (400, 403):
@@ -203,6 +192,67 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
 
 
 # ══════════════════════════════════════════════════════════
+#  GEMINI VISION CALL  (image + text)
+# ══════════════════════════════════════════════════════════
+async def _gemini_vision_call(prompt: str, image_base64: str, mime_type: str = "image/jpeg", max_tokens: int = 800) -> str:
+    if not GEMINI_KEYS:
+        raise HTTPException(503, detail="Chưa cấu hình GEMINI_API_KEY")
+
+    models = _live_models(GEMINI_VISION_MODELS)
+    if not models:
+        raise HTTPException(503, detail="Không có vision model khả dụng")
+
+    async with _gemini_sem:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            for model in models:
+                key = key_pool.get()
+                if not key:
+                    raise HTTPException(429, detail="Quota hết, thử lại sau")
+
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={key}"
+                )
+                body = {
+                    "contents": [{
+                        "parts": [
+                            {"inline_data": {"mime_type": mime_type, "data": image_base64}},
+                            {"text": prompt},
+                        ]
+                    }],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens,
+                        "temperature": 0.2,
+                    },
+                }
+
+                try:
+                    res = await client.post(url, json=body)
+                except Exception as e:
+                    log.warning("Vision call error %s: %s", model, e)
+                    continue
+
+                if res.status_code == 200:
+                    try:
+                        data = res.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except (KeyError, IndexError):
+                        continue
+
+                if res.status_code == 404:
+                    _kill_model(model, 600)
+                    continue
+
+                if res.status_code == 429:
+                    key_pool.penalize(key, 30)
+                    continue
+
+                log.warning("Vision unexpected %d %s", res.status_code, model)
+
+    raise HTTPException(503, detail="Vision model không phản hồi")
+
+
+# ══════════════════════════════════════════════════════════
 #  JSON PARSE
 # ══════════════════════════════════════════════════════════
 def _parse_json(text: str) -> Dict:
@@ -213,12 +263,10 @@ def _parse_json(text: str) -> Dict:
         if inner and inner[-1].strip() == "```":
             inner = inner[:-1]
         text = "\n".join(inner).strip()
-
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start >= 0 and end > start:
         text = text[start:end]
-
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
@@ -239,11 +287,13 @@ class AnalyzeURLRequest(BaseModel):
     country:      Optional[str]  = None
     org:          Optional[str]  = None
 
-
 class AnalyzeTextRequest(BaseModel):
     text:  str
     title: Optional[str] = ""
 
+class AnalyzeImageRequest(BaseModel):
+    imageBase64: str
+    mimeType:    Optional[str] = "image/jpeg"
 
 class ProxyAIRequest(BaseModel):
     messages:   List
@@ -256,11 +306,12 @@ class ProxyAIRequest(BaseModel):
 
 @app.get("/health")
 async def health() -> Dict:
+    live = _live_models(GEMINI_MODELS)
     return {
         "status":      "ok",
         "gemini_keys": len(GEMINI_KEYS),
         "virustotal":  bool(VT_KEY),
-        "live_models": _live_models(),
+        "live_models": live,          # FIX: trả về đúng live models
         "cache_size":  len(_cache),
     }
 
@@ -337,6 +388,45 @@ Trả về JSON hợp lệ (KHÔNG markdown, KHÔNG text ngoài JSON):
     return result
 
 
+@app.post("/analyze/image")
+async def analyze_image(req: AnalyzeImageRequest) -> Dict:
+    """NEW: Phân tích hình ảnh bằng Gemini Vision"""
+    ck = _cache_key("image", req.imageBase64[:64])  # chỉ hash phần đầu để cache
+    cached = _cache_get(ck)
+    if cached is not None:
+        return dict(cached, _cached=True)
+
+    prompt = """Phân tích hình ảnh này và đánh giá:
+1. Đây có phải ảnh được tạo bởi AI không?
+2. Có dấu hiệu chỉnh sửa/giả mạo không?
+3. Nội dung có đáng tin cậy không?
+
+Trả về JSON hợp lệ (KHÔNG markdown, KHÔNG text ngoài JSON):
+{
+  "trustScore": 0-100,
+  "verdict": "authentic|ai-generated|manipulated|uncertain",
+  "confidence": 0-100,
+  "isAIGenerated": true/false,
+  "isManipulated": true/false,
+  "summary": "mô tả ngắn tiếng Việt",
+  "redFlags": ["dấu hiệu đáng ngờ"],
+  "trustFactors": ["yếu tố tích cực"],
+  "overallAssessment": "đánh giá tổng thể 2-3 câu tiếng Việt"
+}"""
+
+    try:
+        raw  = await _gemini_vision_call(prompt, req.imageBase64, req.mimeType or "image/jpeg", 600)
+        data = _parse_json(raw)
+        result = dict({"ok": True}, **data)
+        _cache_set(ck, result, ttl=600)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("analyze_image error: %s", e)
+        raise HTTPException(502, detail=str(e))
+
+
 @app.post("/proxy/ai")
 async def proxy_ai(req: ProxyAIRequest) -> Dict:
     prompt = ""
@@ -391,23 +481,10 @@ async def proxy_dns(body: Dict) -> Dict:
 CF_PREFIXES = (
     "172.64.", "172.65.", "172.66.", "172.67.", "172.68.", "172.69.",
     "172.70.", "172.71.", "172.72.", "172.73.", "172.74.", "172.75.",
-    "172.76.", "172.77.", "172.78.", "172.79.", "172.80.", "172.81.",
-    "172.82.", "172.83.", "172.84.", "172.85.", "172.86.", "172.87.",
-    "172.88.", "172.89.", "172.90.", "172.91.", "172.92.", "172.93.",
-    "172.94.", "172.95.", "172.96.", "172.97.", "172.98.", "172.99.",
-    "172.100.", "172.101.", "172.102.", "172.103.", "172.104.", "172.105.",
-    "172.106.", "172.107.", "172.108.", "172.109.", "172.110.", "172.111.",
-    "172.112.", "172.113.", "172.114.", "172.115.", "172.116.", "172.117.",
-    "172.118.", "172.119.", "172.120.", "172.121.", "172.122.", "172.123.",
-    "172.124.", "172.125.", "172.126.", "172.127.", "172.128.", "172.129.",
-    "172.130.", "172.131.",
     "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.",
     "104.22.", "104.23.", "104.24.", "104.25.", "104.26.", "104.27.",
-    "104.28.", "104.29.", "104.30.", "104.31.",
-    "162.158.", "141.101.64.", "141.101.65.", "141.101.66.", "141.101.67.",
-    "188.114.96.", "188.114.97.", "190.93.240.", "198.41.128.",
+    "162.158.", "141.101.64.", "188.114.96.", "190.93.240.", "198.41.128.",
 )
-
 
 def _is_cloudflare(ip: str) -> bool:
     return any(ip.startswith(p) for p in CF_PREFIXES)
@@ -580,8 +657,7 @@ async def proxy_urlscan(body: Dict) -> Dict:
                 for r in results
             )
             tags: List[str] = list({
-                t
-                for r in results
+                t for r in results
                 for t in r.get("verdicts", {}).get("overall", {}).get("tags", [])
             })
             server = results[0].get("page", {}).get("server") if results else None
