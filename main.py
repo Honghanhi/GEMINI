@@ -14,6 +14,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Ẩn API key khỏi httpx access logs
+import re as _re
+_orig_log = logging.getLogger("httpx")
+class _KeyFilter(logging.Filter):
+    def filter(self, record):
+        if record.getMessage():
+            record.msg = _re.sub(r'key=[A-Za-z0-9_-]{20,}', 'key=***', str(record.msg))
+        return True
+_orig_log.addFilter(_KeyFilter())
 log = logging.getLogger("aiproof")
 
 # ══════════════════════════════════════════════════════════
@@ -28,13 +38,15 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 # BUG FIX: gemini-2.0-flash-lite đã bị remove → 404
 # Dùng các model ổn định hơn
 GEMINI_MODELS: List[str] = [
-    "gemini-1.5-flash",        # nhanh, ổn định
-    "gemini-1.5-flash-8b",     # nhẹ hơn, fallback
-    "gemini-1.5-pro",          # mạnh hơn, dùng khi flash fail
+    "gemini-2.0-flash",        # moi nhat, on dinh (KHONG phai flash-lite)
+    "gemini-1.5-flash",        # fallback on dinh
+    "gemini-1.5-flash-8b",     # nhe hon
+    "gemini-1.5-pro",          # manh hon, dung cuoi
 ]
 
-# Model hỗ trợ vision (image input)
+# Model ho tro vision (image input)
 GEMINI_VISION_MODELS: List[str] = [
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-1.5-pro",
 ]
@@ -106,7 +118,7 @@ def _live_models(model_list: List[str] = None) -> List[str]:
     src = model_list or GEMINI_MODELS
     return [m for m in src if _model_dead_until.get(m, 0) <= now]
 
-def _kill_model(model: str, seconds: int = 300) -> None:
+def _kill_model(model: str, seconds: int = 60) -> None:
     _model_dead_until[model] = time.time() + seconds
     log.warning("Model %s disabled %ds", model, seconds)
 
@@ -176,7 +188,7 @@ async def _gemini_call(prompt: str, max_tokens: int = 1000) -> str:
                         break
 
                     if res.status_code == 404:
-                        _kill_model(model, 600)
+                        _kill_model(model, 60)
                         log.error("404 model not found: %s — killed 600s", model)
                         break
 
@@ -240,7 +252,7 @@ async def _gemini_vision_call(prompt: str, image_base64: str, mime_type: str = "
                         continue
 
                 if res.status_code == 404:
-                    _kill_model(model, 600)
+                    _kill_model(model, 60)
                     continue
 
                 if res.status_code == 429:
@@ -314,6 +326,32 @@ async def health() -> Dict:
         "live_models": live,          # FIX: trả về đúng live models
         "cache_size":  len(_cache),
     }
+
+
+@app.get("/test-key")
+async def test_key() -> Dict:
+    """Debug: test tung key va model"""
+    results = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        for model in GEMINI_MODELS:
+            for key in GEMINI_KEYS[:2]:
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={key}"
+                )
+                body = {"contents": [{"parts": [{"text": "Say OK"}]}], "generationConfig": {"maxOutputTokens": 5}}
+                try:
+                    res = await client.post(url, json=body)
+                    err_msg = ""
+                    if res.status_code != 200:
+                        try:
+                            err_msg = res.json().get("error", {}).get("message", "")
+                        except Exception:
+                            err_msg = res.text[:100]
+                    results.append({"model": model, "key_suffix": key[-6:], "status": res.status_code, "ok": res.status_code == 200, "error": err_msg})
+                except Exception as e:
+                    results.append({"model": model, "key_suffix": key[-6:], "status": 0, "ok": False, "error": str(e)})
+    return {"results": results, "keys_count": len(GEMINI_KEYS)}
 
 
 @app.post("/analyze/url")
